@@ -6307,9 +6307,7 @@ impl SettingsWidget for CloudAgentComputerUseWidget {
 }
 
 struct ApiKeysWidget {
-    openai_api_key_editor: ViewHandle<EditorView>,
-    anthropic_api_key_editor: ViewHandle<EditorView>,
-    google_api_key_editor: ViewHandle<EditorView>,
+    deepseek_api_key_editor: ViewHandle<EditorView>,
 
     can_use_warp_credits_with_byok: SwitchStateHandle,
     upgrade_highlight_index: HighlightedHyperlink,
@@ -6317,20 +6315,14 @@ struct ApiKeysWidget {
 
 impl ApiKeysWidget {
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
-        let ai_settings = AISettings::as_ref(ctx);
         let workspace_handle = UserWorkspaces::handle(ctx);
-        let is_any_ai_enabled = ai_settings.is_any_ai_enabled(ctx);
-        let is_byo_enabled = workspace_handle.as_ref(ctx).is_byo_api_key_enabled();
 
         let ApiKeys {
-            openai: openai_key,
-            anthropic: anthropic_key,
-            google: google_key,
+            deepseek: deepseek_key,
             ..
         } = ApiKeyManager::as_ref(ctx).keys().clone();
 
-        // A helper macro to create and configure an API key editor.  This avoids a lot
-        // of code duplication and ensures consistency between the editors.
+        // A helper macro to create and configure an API key editor.
         macro_rules! create_api_key_editor {
             ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal) => {
                 let $editor = ctx.add_typed_action_view(move |ctx| {
@@ -6356,9 +6348,10 @@ impl ApiKeysWidget {
                     }
                     editor
                 });
+                // Always enable the editor — no subscription check needed.
                 AISettingsPageView::update_editor_interaction_state(
                     $editor.clone(),
-                    is_any_ai_enabled && is_byo_enabled,
+                    true,
                     ctx,
                 );
                 ctx.subscribe_to_view(&$editor, |_, $editor, event, ctx| {
@@ -6371,27 +6364,12 @@ impl ApiKeysWidget {
                     }
                 });
                 let editor_clone = $editor.clone();
-                ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
+                ctx.subscribe_to_model(&workspace_handle, move |_, _workspace, event, ctx| {
                     if let UserWorkspacesEvent::TeamsChanged = event {
-                        let is_any_ai_enabled =
-                            AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
-                        let is_byo_enabled = workspace.as_ref(ctx).is_byo_api_key_enabled();
-                        let is_enabled = is_any_ai_enabled && is_byo_enabled;
-                        let has_key = !editor_clone.as_ref(ctx).is_empty(ctx);
-
-                        // If BYO is disabled, clear the API key from the editor and storage
-                        if !is_byo_enabled && has_key {
-                            editor_clone.update(ctx, |editor, ctx| {
-                                editor.set_buffer_text("", ctx);
-                            });
-                            ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
-                                model.$set_func(None, ctx);
-                            });
-                        }
-
+                        // Always keep editor enabled.
                         AISettingsPageView::update_editor_interaction_state(
                             editor_clone.clone(),
-                            is_enabled,
+                            true,
                             ctx,
                         );
                         ctx.notify();
@@ -6400,24 +6378,10 @@ impl ApiKeysWidget {
             };
         }
 
-        create_api_key_editor!(openai_api_key_editor, openai_key, set_openai_key, "sk-...");
-        create_api_key_editor!(
-            anthropic_api_key_editor,
-            anthropic_key,
-            set_anthropic_key,
-            "sk-ant-..."
-        );
-        create_api_key_editor!(
-            google_api_key_editor,
-            google_key,
-            set_google_key,
-            "AIzaSy..."
-        );
+        create_api_key_editor!(deepseek_api_key_editor, deepseek_key, set_deepseek_key, "sk-...");
 
         Self {
-            openai_api_key_editor,
-            anthropic_api_key_editor,
-            google_api_key_editor,
+            deepseek_api_key_editor,
 
             can_use_warp_credits_with_byok: Default::default(),
             upgrade_highlight_index: Default::default(),
@@ -6428,18 +6392,16 @@ impl ApiKeysWidget {
         &self,
         appearance: &Appearance,
         app: &AppContext,
-        is_byo_enabled: bool,
+        _is_byo_enabled: bool,
     ) -> Box<dyn Element> {
-        let ai_settings = AISettings::as_ref(app);
-        let is_any_ai_enabled = ai_settings.is_any_ai_enabled(app);
-        let is_enabled = is_any_ai_enabled && is_byo_enabled;
+        let is_enabled = true;
 
         let mut column = Flex::column()
             .with_spacing(16.)
             .with_child(
                 Container::new(
                     render_ai_setting_description(
-                        "Use your own API keys from model providers for the Warp Agent to use. API keys are stored locally and never synced to the cloud. Using auto models or models from providers you have not provided API keys for will consume Warp credits.",
+                        "Use your own DeepSeek API key for the Warp Agent. The API key is stored locally and never synced to the cloud.",
                         is_enabled,
                         app,
                     ))
@@ -6488,83 +6450,11 @@ impl ApiKeysWidget {
 
         column.add_child(render_api_key_input(
             appearance,
-            "OpenAI API Key",
-            self.openai_api_key_editor.clone(),
+            "DeepSeek API Key",
+            self.deepseek_api_key_editor.clone(),
             is_enabled,
             app,
         ));
-        column.add_child(render_api_key_input(
-            appearance,
-            "Anthropic API Key",
-            self.anthropic_api_key_editor.clone(),
-            is_enabled,
-            app,
-        ));
-        column.add_child(render_api_key_input(
-            appearance,
-            "Google API Key",
-            self.google_api_key_editor.clone(),
-            is_enabled,
-            app,
-        ));
-
-        // Show upgrade CTA if BYOK is not enabled
-        if !is_byo_enabled {
-            let auth_state = AuthStateProvider::as_ref(app).get();
-            let upgrade_text_fragments = if let Some(team) =
-                UserWorkspaces::as_ref(app).current_team()
-            {
-                // Enterprise teams don't have a self-serve upgrade path; route them
-                // to sales to enable BYOK on their existing plan.
-                if team.billing_metadata.customer_type == CustomerType::Enterprise {
-                    vec![
-                        FormattedTextFragment::hyperlink("Contact sales", "mailto:sales@warp.dev"),
-                        FormattedTextFragment::plain_text(
-                            " to enable bringing your own API keys on your Enterprise plan.",
-                        ),
-                    ]
-                } else {
-                    let current_user_email = auth_state.user_email().unwrap_or_default();
-                    let has_admin_permissions = team.has_admin_permissions(&current_user_email);
-                    let upgrade_url = UserWorkspaces::upgrade_link_for_team(team.uid);
-                    if has_admin_permissions {
-                        vec![
-                            FormattedTextFragment::hyperlink(
-                                "Upgrade to the Build plan",
-                                upgrade_url,
-                            ),
-                            FormattedTextFragment::plain_text(" to use your own API keys."),
-                        ]
-                    } else {
-                        vec![FormattedTextFragment::plain_text(
-                            "Ask your team's admin to upgrade to the Build plan to use your own API keys.",
-                        )]
-                    }
-                }
-            } else {
-                let user_id = auth_state.user_id().unwrap_or_default();
-                let upgrade_url = UserWorkspaces::upgrade_link(user_id);
-                vec![
-                    FormattedTextFragment::hyperlink("Upgrade to the Build plan", upgrade_url),
-                    FormattedTextFragment::plain_text(" to use your own API keys."),
-                ]
-            };
-
-            let upgrade_text_element = FormattedTextElement::new(
-                FormattedText::new([FormattedTextLine::Line(upgrade_text_fragments)]),
-                appearance.ui_font_size(),
-                appearance.ui_font_family(),
-                appearance.ui_font_family(),
-                blended_colors::text_sub(appearance.theme(), appearance.theme().surface_1()),
-                self.upgrade_highlight_index.clone(),
-            )
-            .with_hyperlink_font_color(appearance.theme().accent().into_solid())
-            .register_default_click_handlers(|url, ctx, _| {
-                ctx.dispatch_typed_action(AISettingsPageAction::HyperlinkClick(url));
-            });
-
-            column.add_child(Container::new(upgrade_text_element.finish()).finish());
-        }
 
         column.finish()
     }
@@ -6603,7 +6493,7 @@ impl SettingsWidget for ApiKeysWidget {
     type View = AISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "api keys bring your own byo openai anthropic google claude gemini gpt"
+        "api keys bring your own byo deepseek"
     }
 
     fn render(

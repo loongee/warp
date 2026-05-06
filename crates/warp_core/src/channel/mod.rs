@@ -42,8 +42,8 @@ impl Channel {
     /// (`Dev`, `Local`, `Integration`) continue to honor them for local development and testing.
     pub fn allows_server_url_overrides(&self) -> bool {
         match self {
-            Channel::Dev | Channel::Local | Channel::Integration => true,
-            Channel::Stable | Channel::Preview | Channel::Oss => false,
+            Channel::Dev | Channel::Local | Channel::Integration | Channel::Oss => true,
+            Channel::Stable | Channel::Preview => false,
         }
     }
 

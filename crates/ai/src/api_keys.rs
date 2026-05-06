@@ -22,6 +22,7 @@ pub struct ApiKeys {
     pub anthropic: Option<String>,
     pub openai: Option<String>,
     pub open_router: Option<String>,
+    pub deepseek: Option<String>,
 }
 
 impl ApiKeys {
@@ -30,6 +31,7 @@ impl ApiKeys {
             || self.anthropic.is_some()
             || self.google.is_some()
             || self.open_router.is_some()
+            || self.deepseek.is_some()
     }
 }
 
@@ -93,6 +95,12 @@ impl ApiKeyManager {
         self.write_keys_to_secure_storage(ctx);
     }
 
+    pub fn set_deepseek_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.keys.deepseek = key;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
     pub fn set_aws_credentials_state(
         &mut self,
         state: AwsCredentialsState,
@@ -126,8 +134,15 @@ impl ApiKeyManager {
             .then(|| self.keys.anthropic.clone())
             .flatten()
             .unwrap_or_default();
+        // Use deepseek key in the openai field (DeepSeek is OpenAI-compatible),
+        // falling back to the actual openai key if no deepseek key is set.
         let openai = include_byo_keys
-            .then(|| self.keys.openai.clone())
+            .then(|| {
+                self.keys
+                    .deepseek
+                    .clone()
+                    .or_else(|| self.keys.openai.clone())
+            })
             .flatten()
             .unwrap_or_default();
         let google = include_byo_keys
