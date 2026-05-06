@@ -63,6 +63,7 @@ mod pricing;
 mod profiling;
 mod projects;
 mod prompt;
+pub mod proxy_manager;
 mod quit_warning;
 mod referral_theme_status;
 #[allow(dead_code)]
@@ -312,6 +313,7 @@ use warpui::{AppContext, SingletonEntity, WindowId};
 #[folder = "assets"]
 #[include = "bundled/**"] // Should be kept in sync with BUNDLED_ASSETS_DIR.
 #[include = "async/**"] // Should be kept in sync with ASYNC_ASSETS_DIR.
+#[include = "proxy/**"] // Embedded local proxy server for DeepSeek AI.
 #[cfg_attr(target_family = "wasm", exclude = "async/**")]
 // Excludes take precedence.
 // Standalone CLI builds (the `oz` tarball) are headless and never render the

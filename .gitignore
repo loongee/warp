@@ -5,6 +5,7 @@ app/frameworks/**/*.xcframework
 /target
 /app/target
 /warp.xcworkspace
+/dist
 .idea/
 .DS_Store
 *.icloud

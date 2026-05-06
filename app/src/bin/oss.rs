@@ -15,10 +15,7 @@ fn main() -> Result<()> {
         ChannelConfig {
             app_id: AppId::new("dev", "warp", "WarpOss"),
             logfile_name: "warp-oss.log".into(),
-            server_config: WarpServerConfig {
-                server_root_url: "http://localhost:8765".into(),
-                ..WarpServerConfig::production()
-            },
+            server_config: WarpServerConfig::production(),
             oz_config: OzConfig::production(),
             telemetry_config: None,
             crash_reporting_config: None,
@@ -30,6 +27,15 @@ fn main() -> Result<()> {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
     }
     ChannelState::set(state);
+
+    // Start embedded proxy server (extracts Python files, installs deps, spawns uvicorn).
+    // The _proxy handle keeps the child process alive; it's killed on drop.
+    let proxy = warp::proxy_manager::ProxyManager::start()
+        .expect("Failed to start local proxy server");
+
+    // Override the server URL to point to the dynamically allocated proxy port.
+    ChannelState::override_server_root_url(proxy.url())
+        .expect("Failed to override server root URL");
 
     warp::run()
 }
