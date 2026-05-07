@@ -5,14 +5,94 @@
 //! 2. Creates a Python venv and installs dependencies (first run only)
 //! 3. Finds a free port dynamically
 //! 4. Spawns uvicorn as a child process on that port
-//! 5. Kills the child when dropped (Warp exits)
+//!
+//! On shutdown:
+//! 1. Sends POST /shutdown to the proxy (graceful exit)
+//! 2. Waits up to 3 seconds for the child process to exit
+//! 3. Falls back to SIGKILL if it doesn't exit in time
 
 use std::fs;
+use std::io::Read as _;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, AtomicU16, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::Assets;
+
+/// Global state for the proxy, used by terminate().
+static PROXY_PID: AtomicI32 = AtomicI32::new(0);
+static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
+
+/// Gracefully terminate the proxy server.
+/// Sends POST /shutdown, then waits for the process to exit.
+/// Falls back to SIGKILL after timeout.
+pub fn terminate() {
+    let port = PROXY_PORT.swap(0, Ordering::Relaxed);
+    let pid = PROXY_PID.swap(0, Ordering::Relaxed);
+
+    if port == 0 || pid == 0 {
+        return;
+    }
+
+    log::info!(
+        "[proxy_manager] Sending shutdown request to proxy (port={}, pid={})...",
+        port,
+        pid
+    );
+
+    // Send POST /shutdown to trigger graceful exit.
+    let _ = std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).and_then(|mut stream| {
+        use std::io::Write;
+        let request = format!(
+            "POST /shutdown HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 0\r\n\r\n",
+            port
+        );
+        stream.write_all(request.as_bytes())?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        let mut buf = [0u8; 256];
+        let _ = stream.read(&mut buf);
+        Ok(())
+    });
+
+    // Wait for process to exit (up to 3 seconds).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        #[cfg(unix)]
+        {
+            let result = unsafe { libc::kill(pid, 0) };
+            if result != 0 {
+                log::info!("[proxy_manager] Proxy server exited gracefully.");
+                break;
+            }
+        }
+
+        if Instant::now() > deadline {
+            log::warn!("[proxy_manager] Proxy did not exit in time, force killing (pid={})...", pid);
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Clean up env var.
+    std::env::remove_var("WARP_PROXY_PORT");
+}
+
+/// Called by libc::atexit as a safety net.
+#[cfg(unix)]
+extern "C" fn kill_proxy_on_exit() {
+    let pid = PROXY_PID.swap(0, Ordering::Relaxed);
+    if pid > 0 {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
 
 pub struct ProxyManager {
     child: Option<Child>,
@@ -21,8 +101,23 @@ pub struct ProxyManager {
 
 impl ProxyManager {
     /// Start the local proxy server. Blocks briefly for venv setup on first run.
-    /// Returns the manager which holds the child process and the allocated port.
+    /// Only the primary process should start the proxy — child processes (crash reporter,
+    /// plugin host, etc.) skip by checking WARP_PROXY_PORT env var.
     pub fn start() -> anyhow::Result<Self> {
+        // If WARP_PROXY_PORT is set, we're a child process — reuse the existing proxy.
+        if let Ok(port_str) = std::env::var("WARP_PROXY_PORT") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                log::info!(
+                    "[proxy_manager] Child process: reusing existing proxy on port {}",
+                    port
+                );
+                return Ok(Self {
+                    child: None,
+                    port,
+                });
+            }
+        }
+
         let proxy_dir = Self::proxy_dir();
         Self::extract_assets(&proxy_dir)?;
         Self::ensure_venv(&proxy_dir)?;
@@ -30,7 +125,20 @@ impl ProxyManager {
         let port = Self::find_free_port()?;
         let child = Self::spawn_server(&proxy_dir, port)?;
 
-        // Wait for the server to be ready (up to 30 seconds for first-run import).
+        // Set env var so child processes know a proxy is already running.
+        std::env::set_var("WARP_PROXY_PORT", port.to_string());
+
+        // Store globally for terminate().
+        PROXY_PID.store(child.id() as i32, Ordering::Relaxed);
+        PROXY_PORT.store(port, Ordering::Relaxed);
+
+        // Register atexit as a safety net.
+        #[cfg(unix)]
+        unsafe {
+            libc::atexit(kill_proxy_on_exit);
+        }
+
+        // Wait for the server to be ready.
         Self::wait_for_ready(port)?;
         Ok(Self {
             child: Some(child),
@@ -41,7 +149,6 @@ impl ProxyManager {
     /// Poll until the proxy server accepts connections, or timeout.
     fn wait_for_ready(port: u16) -> anyhow::Result<()> {
         use std::net::TcpStream;
-        use std::time::{Duration, Instant};
 
         let deadline = Instant::now() + Duration::from_secs(30);
         let addr = format!("127.0.0.1:{}", port);
@@ -81,14 +188,14 @@ impl ProxyManager {
     fn find_free_port() -> anyhow::Result<u16> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        // Drop the listener to release the port before uvicorn binds it.
         drop(listener);
         Ok(port)
     }
 
     fn extract_assets(target: &Path) -> anyhow::Result<()> {
-        // Use CARGO_PKG_VERSION as a version marker to avoid re-extracting unchanged files.
-        let version = env!("CARGO_PKG_VERSION");
+        // Use a build-time timestamp as version marker to force re-extraction
+        // whenever the binary is recompiled.
+        let version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("CARGO_PKG_NAME"));
         let marker = target.join(".version");
         if marker.exists() {
             if let Ok(existing) = fs::read_to_string(&marker) {
@@ -140,7 +247,6 @@ impl ProxyManager {
             }
         }
 
-        // Install/update dependencies. pip install -q is fast when already satisfied.
         let pip_bin = if cfg!(target_os = "windows") {
             venv.join("Scripts").join("pip.exe")
         } else {
@@ -158,20 +264,17 @@ impl ProxyManager {
             anyhow::bail!("pip install failed (exit code: {:?})", status.code());
         }
 
-        // Create go_features_pb2.py stub in the protobuf package.
-        // The generated proto code imports this Go-specific extension that isn't
-        // shipped with the Python protobuf package.
         Self::create_go_features_stub(&venv)?;
-
         Ok(())
     }
 
     fn create_go_features_stub(venv: &Path) -> anyhow::Result<()> {
-        // Find the google.protobuf package directory inside the venv.
         let site_packages = if cfg!(target_os = "windows") {
-            venv.join("Lib").join("site-packages")
+            venv.join("Lib")
+                .join("site-packages")
+                .join("google")
+                .join("protobuf")
         } else {
-            // Find the python version directory dynamically.
             let lib_dir = venv.join("lib");
             let mut pb_dir = None;
             if let Ok(entries) = fs::read_dir(&lib_dir) {
@@ -220,36 +323,42 @@ DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
             proxy_dir.join(".venv/bin/python3")
         };
 
-        log::info!(
-            "[proxy_manager] Starting proxy server on port {}...",
-            port
-        );
+        log::info!("[proxy_manager] Starting proxy server on port {}...", port);
 
-        let child = Command::new(&python)
-            .args([
-                "-m",
-                "uvicorn",
-                "server:app",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                &port.to_string(),
-            ])
-            .current_dir(proxy_dir)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+        let log_path = proxy_dir.join("proxy.log");
+        let log_file = fs::File::create(&log_path)?;
+        let log_stderr = log_file.try_clone()?;
 
+        log::info!("[proxy_manager] Proxy logs: {:?}", log_path);
+
+        let mut cmd = Command::new(&python);
+        cmd.args([
+            "-m",
+            "uvicorn",
+            "server:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ])
+        .current_dir(proxy_dir)
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(log_stderr));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+
+        let child = cmd.spawn()?;
         Ok(child)
     }
 }
 
 impl Drop for ProxyManager {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            log::info!("[proxy_manager] Shutting down proxy server...");
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        // Drop is a no-op — terminate() handles graceful shutdown.
+        // This avoids blocking the main thread.
     }
 }

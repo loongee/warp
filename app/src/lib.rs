@@ -1948,6 +1948,10 @@ pub(crate) fn app_callbacks(is_integration_test: bool) -> warpui::platform::AppC
             );
         })),
         on_will_terminate: Some(Box::new(move |ctx| {
+            // Terminate the proxy server first, so any pending HTTP requests
+            // to it fail immediately and don't block the shutdown sequence.
+            proxy_manager::terminate();
+
             NotebookManager::handle(ctx).update(ctx, |manager, ctx| {
                 // Notebooks are only saved periodically, so ensure that any pending changes have
                 // been sent to the writer thread before terminating.

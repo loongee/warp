@@ -61,6 +61,19 @@ async def health():
     return {"status": "ok"}
 
 
+# --- Shutdown endpoint ---
+
+@app.post("/shutdown")
+async def shutdown():
+    """Gracefully shut down the proxy server."""
+    import asyncio
+    import os
+    import signal
+
+    asyncio.get_event_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+    return {"status": "shutting_down"}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT)
