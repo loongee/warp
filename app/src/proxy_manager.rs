@@ -354,6 +354,13 @@ DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
         let child = cmd.spawn()?;
         Ok(child)
     }
+
+    /// Check if first-run setup is needed (venv doesn't exist yet).
+    pub fn needs_first_run_setup() -> bool {
+        let proxy_dir = Self::proxy_dir();
+        let venv_python = proxy_dir.join(".venv/bin/python3");
+        !venv_python.exists()
+    }
 }
 
 impl Drop for ProxyManager {

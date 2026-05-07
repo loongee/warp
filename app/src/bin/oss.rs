@@ -28,21 +28,38 @@ fn main() -> Result<()> {
     }
     ChannelState::set(state);
 
-    // Start embedded proxy server (extracts Python files, installs deps, spawns uvicorn).
-    let proxy = warp::proxy_manager::ProxyManager::start()
-        .expect("Failed to start local proxy server");
+    if warp::proxy_manager::ProxyManager::needs_first_run_setup() {
+        // First run: start Warp UI first, then initialize proxy in background.
+        // The proxy setup (venv + pip install) can take 10-30 seconds.
+        // Warp will show its UI immediately; AI requests will fail until proxy is ready,
+        // but the user won't see a frozen screen.
+        eprintln!("[oss] First run detected — proxy will initialize in background...");
+        std::thread::spawn(|| {
+            match warp::proxy_manager::ProxyManager::start() {
+                Ok(proxy) => {
+                    let proxy_url = proxy.url();
+                    eprintln!("[oss] Proxy started on {}", proxy_url);
+                    if let Err(e) = ChannelState::override_server_root_url(proxy_url) {
+                        eprintln!("[oss] Failed to override server root URL: {}", e);
+                    }
+                    std::mem::forget(proxy);
+                }
+                Err(e) => {
+                    eprintln!("[oss] Failed to start local proxy server: {}", e);
+                }
+            }
+        });
+    } else {
+        // Subsequent runs: proxy starts quickly (no pip install needed).
+        let proxy = warp::proxy_manager::ProxyManager::start()
+            .expect("Failed to start local proxy server");
+        let proxy_url = proxy.url();
+        eprintln!("[oss] Proxy started on {}", proxy_url);
+        ChannelState::override_server_root_url(proxy_url)
+            .expect("Failed to override server root URL");
+        std::mem::forget(proxy);
+    }
 
-    // Override the server URL to point to the dynamically allocated proxy port.
-    let proxy_url = proxy.url();
-    eprintln!("[oss] Proxy started on {}", proxy_url);
-    ChannelState::override_server_root_url(proxy_url)
-        .expect("Failed to override server root URL");
-
-    // Forget the proxy handle — atexit will kill the child process.
-    // This prevents Drop from running during app shutdown which can cause hangs.
-    std::mem::forget(proxy);
-
-    eprintln!("[oss] Calling warp::run()...");
     warp::run()
 }
 
