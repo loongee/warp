@@ -331,6 +331,41 @@ DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
 
         log::info!("[proxy_manager] Proxy logs: {:?}", log_path);
 
+        // Create a pipe for parent-liveness detection.
+        // The parent holds the write end; the child monitors the read end.
+        // When the parent exits (even via SIGKILL), the write end closes and
+        // the child sees EOF on the read end, triggering a clean exit.
+        #[cfg(unix)]
+        let parent_alive_read_fd = {
+            let mut fds = [0i32; 2];
+            let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+            if ret != 0 {
+                anyhow::bail!("Failed to create pipe for parent-liveness detection");
+            }
+            let read_fd = fds[0]; // child will monitor this
+            let _write_fd = fds[1]; // parent keeps this open (leaked intentionally)
+
+            // Set FD_CLOEXEC on the WRITE end so it's NOT inherited by the child.
+            // Only the parent should hold the write end.
+            unsafe {
+                let flags = libc::fcntl(_write_fd, libc::F_GETFD);
+                libc::fcntl(_write_fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+
+            // Ensure the read end does NOT have CLOEXEC so the child inherits it.
+            unsafe {
+                let flags = libc::fcntl(read_fd, libc::F_GETFD);
+                libc::fcntl(read_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC);
+            }
+
+            // Note: _write_fd is a raw i32, not wrapped in a File/OwnedFd,
+            // so it won't be closed when this scope ends. It remains open for
+            // the lifetime of this process. When this process exits, the OS
+            // closes it, and the child detects EOF.
+
+            read_fd
+        };
+
         let mut cmd = Command::new(&python);
         cmd.args([
             "-m",
@@ -344,6 +379,10 @@ DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
         .current_dir(proxy_dir)
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(log_stderr));
+
+        // Pass the read FD number to the child via environment variable.
+        #[cfg(unix)]
+        cmd.env("WARP_PARENT_ALIVE_FD", parent_alive_read_fd.to_string());
 
         #[cfg(unix)]
         {

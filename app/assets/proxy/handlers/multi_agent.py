@@ -60,6 +60,155 @@ def _extract_user_query(req: request_pb2.Request) -> str:
     return ""
 
 
+def _extract_referenced_attachments(req: request_pb2.Request) -> str:
+    """Extract referenced_attachments from the UserQuery and format as context string.
+
+    When a user uses 'Attach as agent context', Warp stores those attachments in
+    user_query.referenced_attachments (a map<string, Attachment>). This function
+    extracts them and returns a formatted context string.
+    """
+    inp = req.input
+    if not inp or not inp.HasField("type"):
+        return ""
+
+    attachments_map = None
+    field_name = inp.WhichOneof("type")
+
+    if field_name == "user_inputs":
+        for user_input in inp.user_inputs.inputs:
+            if user_input.HasField("user_query"):
+                attachments_map = user_input.user_query.referenced_attachments
+                break
+    elif field_name == "user_query":
+        attachments_map = inp.user_query.referenced_attachments
+
+    if not attachments_map:
+        return ""
+
+    context_parts = []
+    for key, attachment in attachments_map.items():
+        value_field = attachment.WhichOneof("value")
+        if not value_field:
+            continue
+
+        if value_field == "plain_text":
+            context_parts.append(f"[Attached text - {key}]\n{attachment.plain_text}")
+        elif value_field == "executed_shell_command":
+            cmd = attachment.executed_shell_command
+            context_parts.append(
+                f"[Attached command output - {key}]\n"
+                f"$ {cmd.command}\n"
+                f"Exit code: {cmd.exit_code}\n"
+                f"Output:\n{cmd.output}"
+            )
+        elif value_field == "running_shell_command":
+            cmd = attachment.running_shell_command
+            snapshot_output = cmd.snapshot.output if cmd.HasField("snapshot") else ""
+            context_parts.append(
+                f"[Attached running command - {key}]\n"
+                f"$ {cmd.command}\n"
+                f"Output so far:\n{snapshot_output}"
+            )
+        elif value_field == "document_content":
+            doc = attachment.document_content
+            # DocumentContent has various fields; try to extract text
+            context_parts.append(f"[Attached document - {key}]\n{doc}")
+        elif value_field == "file_path_reference":
+            ref = attachment.file_path_reference
+            context_parts.append(f"[Attached file reference - {key}]\nFile: {ref.file_path}")
+        elif value_field == "diff_set":
+            ds = attachment.diff_set
+            hunks_text = []
+            for hunk in ds.hunks:
+                hunks_text.append(f"  {hunk.file_path}:\n{hunk.diff_content}")
+            context_parts.append(
+                f"[Attached diff - {key}]\n" + "\n".join(hunks_text)
+            )
+        elif value_field == "drive_object":
+            obj = attachment.drive_object
+            payload_field = obj.WhichOneof("object_payload")
+            if payload_field == "workflow":
+                context_parts.append(
+                    f"[Attached workflow - {key}]\n"
+                    f"Name: {obj.workflow.name}\n"
+                    f"Description: {obj.workflow.description}\n"
+                    f"Command: {obj.workflow.command}"
+                )
+            elif payload_field == "notebook":
+                context_parts.append(
+                    f"[Attached notebook - {key}]\n"
+                    f"Title: {obj.notebook.title}\n"
+                    f"Content:\n{obj.notebook.content}"
+                )
+            elif payload_field == "generic_string_object":
+                context_parts.append(
+                    f"[Attached object - {key}]\n{obj.generic_string_object.payload}"
+                )
+        else:
+            context_parts.append(f"[Attached context - {key}] (type: {value_field})")
+
+    if not context_parts:
+        return ""
+
+    return "\n\n".join(context_parts)
+
+
+def _extract_input_context(req: request_pb2.Request) -> str:
+    """Extract InputContext (files, selected text, images, commands) from req.input.context.
+
+    This contains contextual information provided as agent context via
+    "Attach as agent context". The main sources are:
+    - executed_shell_commands: command blocks attached as context
+    - selected_text: text selections attached as context
+    - files: file contents attached as context
+    - images: image data attached as context
+    """
+    inp = req.input
+    if not inp:
+        return ""
+
+    # InputContext is always present (not part of oneof), accessed via inp.context
+    ctx = inp.context
+    if not ctx:
+        return ""
+
+    context_parts = []
+
+    # Executed shell commands (this is where "Attach as agent context" puts command blocks)
+    for cmd in ctx.executed_shell_commands:
+        cmd_text = f"[Attached command output]\n$ {cmd.command}"
+        if cmd.exit_code != 0:
+            cmd_text += f"\nExit code: {cmd.exit_code}"
+        if cmd.output:
+            cmd_text += f"\nOutput:\n{cmd.output}"
+        context_parts.append(cmd_text)
+
+    # Selected text blocks
+    for selected in ctx.selected_text:
+        if selected.text:
+            context_parts.append(f"[Selected text]\n{selected.text}")
+
+    # Attached files (FileContent)
+    for file_entry in ctx.files:
+        if file_entry.content:
+            fc = file_entry.content
+            # FileContent has path and content fields
+            path = fc.path if hasattr(fc, 'path') and fc.path else "unknown"
+            content = fc.content if hasattr(fc, 'content') and fc.content else ""
+            if content:
+                context_parts.append(f"[Attached file: {path}]\n{content}")
+
+    # Images (binary data - we note their presence but don't pass raw bytes to text model)
+    for img in ctx.images:
+        mime = img.mime_type if img.mime_type else "image/*"
+        context_parts.append(f"[Attached image ({mime}) - binary data not shown]")
+
+    if not context_parts:
+        return ""
+
+    return "\n\n".join(context_parts)
+
+
 def _extract_tool_call_results(req: request_pb2.Request) -> list[dict]:
     """Extract tool call results from the request (user approved/rejected a command)."""
     results = []
@@ -145,7 +294,38 @@ def _extract_conversation_history(req: request_pb2.Request) -> list[dict]:
             msg_type, msg = raw_msgs[i]
 
             if msg_type == "user_query":
-                messages.append({"role": "user", "content": msg.user_query.query})
+                # Include referenced_attachments from history messages
+                uq = msg.user_query
+                query_text = uq.query
+                if uq.referenced_attachments:
+                    att_parts = []
+                    for key, attachment in uq.referenced_attachments.items():
+                        value_field = attachment.WhichOneof("value")
+                        if value_field == "plain_text":
+                            att_parts.append(f"[Attached: {key}]\n{attachment.plain_text}")
+                        elif value_field == "executed_shell_command":
+                            cmd = attachment.executed_shell_command
+                            att_parts.append(
+                                f"[Attached command: {key}]\n$ {cmd.command}\n"
+                                f"Output:\n{cmd.output}"
+                            )
+                        elif value_field == "file_path_reference":
+                            att_parts.append(f"[Attached file: {attachment.file_path_reference.file_path}]")
+                        elif value_field == "document_content":
+                            att_parts.append(f"[Attached document: {key}]\n{attachment.document_content}")
+                        elif value_field == "diff_set":
+                            hunks = [f"  {h.file_path}:\n{h.diff_content}" for h in attachment.diff_set.hunks]
+                            att_parts.append(f"[Attached diff: {key}]\n" + "\n".join(hunks))
+                        elif value_field:
+                            att_parts.append(f"[Attached: {key}] (type: {value_field})")
+                    if att_parts:
+                        query_text = (
+                            "<attached_context>\n"
+                            + "\n\n".join(att_parts)
+                            + "\n</attached_context>\n\n"
+                            + query_text
+                        )
+                messages.append({"role": "user", "content": query_text})
                 i += 1
 
             elif msg_type == "agent_output":
@@ -248,17 +428,38 @@ async def multi_agent_handler(request: Request):
     user_query = _extract_user_query(req)
     tool_call_results = _extract_tool_call_results(req)
 
+    # Extract attached context (from "Attach as agent context")
+    referenced_attachments_text = _extract_referenced_attachments(req)
+    input_context_text = _extract_input_context(req)
+
     if user_query:
         print(f"[multi-agent] User query: {user_query[:100]}...")
-    elif tool_call_results:
+    if referenced_attachments_text:
+        print(f"[multi-agent] Referenced attachments found ({len(referenced_attachments_text)} chars)")
+    if input_context_text:
+        print(f"[multi-agent] Input context found ({len(input_context_text)} chars)")
+    if tool_call_results:
         print(f"[multi-agent] Tool call results: {len(tool_call_results)} result(s)")
 
     # 2. Build conversation history.
     history = _extract_conversation_history(req)
 
-    # Add current input
+    # Add current input - prepend context to user query if available
     if user_query:
-        history.append({"role": "user", "content": user_query})
+        # Build user message with context included
+        context_prefix = ""
+        if referenced_attachments_text or input_context_text:
+            context_sections = []
+            if input_context_text:
+                context_sections.append(input_context_text)
+            if referenced_attachments_text:
+                context_sections.append(referenced_attachments_text)
+            context_prefix = (
+                "<attached_context>\n"
+                + "\n\n".join(context_sections)
+                + "\n</attached_context>\n\n"
+            )
+        history.append({"role": "user", "content": context_prefix + user_query})
     elif tool_call_results:
         for tcr in tool_call_results:
             history.append({
