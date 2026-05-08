@@ -1,7 +1,10 @@
 """GraphQL mock handler for Warp client compatibility."""
 import json
+import logging
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger("warp-proxy.graphql")
 
 router = APIRouter()
 
@@ -120,5 +123,5 @@ async def graphql_handler(request: Request):
         pass
 
     # Fallback: return empty data so the client doesn't crash.
-    print(f"[graphql] Unhandled operation: {op}")
+    logger.debug("Unhandled operation: %s", op)
     return JSONResponse({"data": {}})

@@ -5,6 +5,7 @@ ResponseEvent messages as SSE (base64url-encoded protobuf).
 """
 import base64
 import json
+import logging
 import sys
 import uuid
 import os
@@ -23,6 +24,8 @@ import task_pb2  # noqa: E402
 from google.protobuf import field_mask_pb2  # noqa: E402
 
 from deepseek_client import stream_chat, get_all_cached_reasoning, cache_reasoning  # noqa: E402
+
+logger = logging.getLogger("warp-proxy.multi_agent")
 
 router = APIRouter()
 
@@ -420,10 +423,11 @@ async def multi_agent_handler(request: Request):
 
     # Debug: show what keys the client sent
     ak = req.settings.api_keys
-    print(f"[multi-agent] API keys received - openai: {'***' + ak.openai[-4:] if ak.openai else 'empty'}, "
-          f"anthropic: {'***' + ak.anthropic[-4:] if ak.anthropic else 'empty'}, "
-          f"google: {'***' + ak.google[-4:] if ak.google else 'empty'}, "
-          f"open_router: {'***' + ak.open_router[-4:] if ak.open_router else 'empty'}")
+    logger.info("API keys received - openai: %s, anthropic: %s, google: %s, open_router: %s",
+                '***' + ak.openai[-4:] if ak.openai else 'empty',
+                '***' + ak.anthropic[-4:] if ak.anthropic else 'empty',
+                '***' + ak.google[-4:] if ak.google else 'empty',
+                '***' + ak.open_router[-4:] if ak.open_router else 'empty')
 
     user_query = _extract_user_query(req)
     tool_call_results = _extract_tool_call_results(req)
@@ -433,13 +437,13 @@ async def multi_agent_handler(request: Request):
     input_context_text = _extract_input_context(req)
 
     if user_query:
-        print(f"[multi-agent] User query: {user_query[:100]}...")
+        logger.info("User query: %s...", user_query[:100])
     if referenced_attachments_text:
-        print(f"[multi-agent] Referenced attachments found ({len(referenced_attachments_text)} chars)")
+        logger.info("Referenced attachments found (%d chars)", len(referenced_attachments_text))
     if input_context_text:
-        print(f"[multi-agent] Input context found ({len(input_context_text)} chars)")
+        logger.info("Input context found (%d chars)", len(input_context_text))
     if tool_call_results:
-        print(f"[multi-agent] Tool call results: {len(tool_call_results)} result(s)")
+        logger.info("Tool call results: %d result(s)", len(tool_call_results))
 
     # 2. Build conversation history.
     history = _extract_conversation_history(req)
@@ -515,7 +519,7 @@ async def multi_agent_handler(request: Request):
     history = cleaned_history
 
     # Debug: print history roles
-    print(f"[multi-agent] History ({len(history)} messages): {[m['role'] for m in history]}")
+    logger.info("History (%d messages): %s", len(history), [m['role'] for m in history])
 
     async def event_generator():
         # Event 1: StreamInit
@@ -579,7 +583,7 @@ async def multi_agent_handler(request: Request):
 
                 elif event_type == "tool_call_start":
                     current_tool_call = data
-                    print(f"[multi-agent] Tool call: {data['name']}")
+                    logger.info("Tool call: %s", data['name'])
 
                 elif event_type == "tool_call_args":
                     pass  # Arguments accumulated in deepseek_client
@@ -626,9 +630,7 @@ async def multi_agent_handler(request: Request):
                     break
 
         except Exception as e:
-            print(f"[multi-agent] DeepSeek error: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("DeepSeek error: %s", e)
             error_event = response_pb2.ResponseEvent()
             error_event.finished.internal_error.message = str(e)
             yield _make_event(error_event)

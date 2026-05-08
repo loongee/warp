@@ -328,15 +328,6 @@ DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
 
         log::info!("[proxy_manager] Starting proxy server on port {}...", port);
 
-        let log_path = proxy_dir.join("proxy.log");
-        let log_file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
-        let log_stderr = log_file.try_clone()?;
-
-        log::info!("[proxy_manager] Proxy logs: {:?}", log_path);
-
         // Create a pipe for parent-liveness detection.
         // The parent holds the write end; the child monitors the read end.
         // When the parent exits (even via SIGKILL), the write end closes and
@@ -383,8 +374,8 @@ DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
             &port.to_string(),
         ])
         .current_dir(proxy_dir)
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_stderr));
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
         // Pass the read FD number to the child via environment variable.
         #[cfg(unix)]

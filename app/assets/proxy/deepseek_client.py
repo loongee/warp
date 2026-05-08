@@ -1,7 +1,10 @@
 """DeepSeek streaming client wrapper with tool/function calling support."""
 import json
+import logging
 import httpx
 from config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL
+
+logger = logging.getLogger("warp-proxy.deepseek")
 
 # Tools definition for DeepSeek (OpenAI-compatible function calling format)
 TOOLS = [
@@ -155,8 +158,8 @@ async def stream_chat(messages: list[dict], model: str | None = None, tools_enab
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
             if resp.status_code != 200:
                 body = await resp.aread()
-                print(f"[deepseek] Error {resp.status_code}: {body.decode()}")
-                print(f"[deepseek] Request payload messages: {json.dumps(full_messages, ensure_ascii=False, default=str)[:2000]}")
+                logger.error("Error %d: %s", resp.status_code, body.decode())
+                logger.error("Request payload messages: %s", json.dumps(full_messages, ensure_ascii=False, default=str)[:2000])
                 resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):

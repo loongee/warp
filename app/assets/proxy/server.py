@@ -6,9 +6,9 @@ Usage:
 Then start Warp with:
     WARP_SERVER_ROOT_URL=http://localhost:8765 ./target/debug/warp-oss
 """
-import sys
 import os
 import signal
+import logging
 import threading
 
 from fastapi import FastAPI, Request
@@ -17,6 +17,20 @@ from fastapi.responses import JSONResponse
 from config import SERVER_PORT
 from handlers.graphql import router as graphql_router
 from handlers.multi_agent import router as multi_agent_router
+
+# --- Logging setup ---
+# Log to file in append mode, managed entirely by Python logging.
+_log_dir = os.path.dirname(os.path.abspath(__file__))
+_log_file = os.path.join(_log_dir, "proxy.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    filename=_log_file,
+    filemode="a",
+)
+logger = logging.getLogger("warp-proxy")
 
 app = FastAPI(title="Warp Local Proxy")
 
@@ -37,25 +51,25 @@ def _monitor_parent_pipe():
     """
     fd_str = os.environ.get("WARP_PARENT_ALIVE_FD")
     if not fd_str:
-        print("[server] WARP_PARENT_ALIVE_FD not set, parent-liveness monitor disabled.")
+        logger.info("WARP_PARENT_ALIVE_FD not set, parent-liveness monitor disabled.")
         return
 
     try:
         fd = int(fd_str)
     except ValueError:
-        print(f"[server] Invalid WARP_PARENT_ALIVE_FD value: {fd_str}")
+        logger.warning("Invalid WARP_PARENT_ALIVE_FD value: %s", fd_str)
         return
 
-    print(f"[server] Monitoring parent liveness via fd {fd}...")
+    logger.info("Monitoring parent liveness via fd %d...", fd)
 
     try:
         # This blocks until the write-end is closed (parent exits) → returns b''
         # or until any data is written (shouldn't happen) → also means exit.
         data = os.read(fd, 1)
         # If we get here, the pipe was closed (EOF) or unexpected data.
-        print(f"[server] Parent pipe closed (read returned {repr(data)}), shutting down...")
+        logger.info("Parent pipe closed (read returned %r), shutting down...", data)
     except OSError as e:
-        print(f"[server] Parent pipe error: {e}, shutting down...")
+        logger.warning("Parent pipe error: %s, shutting down...", e)
 
     # Self-terminate. Use SIGTERM for graceful uvicorn shutdown.
     os.kill(os.getpid(), signal.SIGTERM)
@@ -82,14 +96,14 @@ async def auth_mock(path: str, request: Request):
 @app.get("/api/v1/{path:path}")
 async def api_get_fallback(path: str, request: Request):
     """Catch-all for GET /api/v1/* — return empty JSON."""
-    print(f"[api] Unhandled GET /api/v1/{path}")
+    logger.debug("Unhandled GET /api/v1/%s", path)
     return JSONResponse({})
 
 
 @app.post("/api/v1/{path:path}")
 async def api_post_fallback(path: str, request: Request):
     """Catch-all for POST /api/v1/* — return empty JSON."""
-    print(f"[api] Unhandled POST /api/v1/{path}")
+    logger.debug("Unhandled POST /api/v1/%s", path)
     return JSONResponse({})
 
 
@@ -97,7 +111,7 @@ async def api_post_fallback(path: str, request: Request):
 async def ai_fallback(path: str, request: Request):
     """Catch-all for other /ai/* endpoints (e.g. passive-suggestions)."""
     if path != "multi-agent":
-        print(f"[ai] Unhandled POST /ai/{path}")
+        logger.debug("Unhandled POST /ai/%s", path)
     return JSONResponse({})
 
 
@@ -114,9 +128,8 @@ async def health():
 async def shutdown():
     """Gracefully shut down the proxy server."""
     import asyncio
-    import os
-    import signal
 
+    logger.info("Shutdown requested, exiting in 0.5s...")
     asyncio.get_event_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
     return {"status": "shutting_down"}
 
