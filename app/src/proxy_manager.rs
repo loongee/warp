@@ -21,6 +21,9 @@ use std::time::{Duration, Instant};
 
 use crate::Assets;
 
+/// SHA-256 hash of all proxy .py files, computed at build time by build.rs.
+const PROXY_ASSETS_HASH: &str = include_str!(concat!(env!("OUT_DIR"), "/proxy_assets_hash.txt"));
+
 /// Global state for the proxy, used by terminate().
 static PROXY_PID: AtomicI32 = AtomicI32::new(0);
 static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
@@ -193,9 +196,9 @@ impl ProxyManager {
     }
 
     fn extract_assets(target: &Path) -> anyhow::Result<()> {
-        // Use a build-time timestamp as version marker to force re-extraction
-        // whenever the binary is recompiled.
-        let version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("CARGO_PKG_NAME"));
+        // Compare the build-time hash of proxy .py files against the on-disk marker.
+        // Re-extract only when the hash differs (i.e., source files changed).
+        let version = PROXY_ASSETS_HASH.trim();
         let marker = target.join(".version");
         if marker.exists() {
             if let Ok(existing) = fs::read_to_string(&marker) {
@@ -222,7 +225,7 @@ impl ProxyManager {
         }
 
         fs::write(&marker, version)?;
-        log::info!("[proxy_manager] Extraction complete (version {})", version);
+        log::info!("[proxy_manager] Extraction complete (hash {})", version);
         Ok(())
     }
 
@@ -326,7 +329,10 @@ DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(
         log::info!("[proxy_manager] Starting proxy server on port {}...", port);
 
         let log_path = proxy_dir.join("proxy.log");
-        let log_file = fs::File::create(&log_path)?;
+        let log_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
         let log_stderr = log_file.try_clone()?;
 
         log::info!("[proxy_manager] Proxy logs: {:?}", log_path);

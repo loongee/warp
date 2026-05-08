@@ -31,6 +31,9 @@ fn main() -> Result<()> {
 
     add_features(&target_family, &target_os);
 
+    // Compute proxy assets hash at build time.
+    compute_proxy_assets_hash();
+
     if target_os == "macos" && target_family != "wasm" {
         println!("cargo:rustc-link-lib=framework=MetalKit");
         println!("cargo:rustc-link-lib=framework=UserNotifications");
@@ -527,4 +530,50 @@ END
     embed_resource::compile(resource_file_path, embed_resource::NONE)
         .manifest_required()
         .unwrap_or_else(|err| panic!("Unable to embed resource file: {err:#}"));
+}
+
+/// Compute a SHA-256 hash of all `.py` files under `assets/proxy/` and write
+/// the hex digest to `$OUT_DIR/proxy_assets_hash.txt`. This is read at compile
+/// time by `proxy_manager.rs` via `include_str!` to determine whether the
+/// extracted proxy files on disk are stale and need re-extraction.
+fn compute_proxy_assets_hash() {
+    let proxy_dir = Path::new("assets/proxy");
+
+    // Tell Cargo to re-run this build script whenever any file under assets/proxy changes.
+    println!("cargo:rerun-if-changed=assets/proxy");
+
+    let mut py_files: Vec<PathBuf> = Vec::new();
+    if proxy_dir.exists() {
+        for entry in WalkDir::new(proxy_dir) {
+            let entry = entry.expect("Failed to walk assets/proxy");
+            let path = entry.path();
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "py") {
+                py_files.push(path.to_path_buf());
+            }
+        }
+    }
+
+    // Sort for deterministic hash regardless of filesystem ordering.
+    py_files.sort();
+
+    let mut hasher = sha2::Sha256::new();
+    for path in &py_files {
+        // Include relative path in hash to detect renames/moves.
+        let relative = path
+            .strip_prefix("assets/proxy")
+            .unwrap_or(path);
+        hasher.update(relative.to_string_lossy().as_bytes());
+        let contents = fs::read(path).unwrap_or_else(|err| {
+            panic!("Failed to read {}: {err}", path.display())
+        });
+        hasher.update(&contents);
+    }
+
+    let hash_hex = format!("{:x}", hasher.finalize());
+
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR must be set");
+    let hash_path = Path::new(&out_dir).join("proxy_assets_hash.txt");
+    fs::write(&hash_path, &hash_hex).unwrap_or_else(|err| {
+        panic!("Failed to write proxy hash to {}: {err}", hash_path.display())
+    });
 }
