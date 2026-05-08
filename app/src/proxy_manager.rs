@@ -1,7 +1,7 @@
 //! Manages the embedded Python proxy server for local DeepSeek AI conversations.
 //!
 //! On startup:
-//! 1. Extracts embedded proxy Python source to ~/.warp-proxy/
+//! 1. Extracts embedded proxy Python source to <data_dir>/proxy/
 //! 2. Creates a Python venv and installs dependencies (first run only)
 //! 3. Finds a free port dynamically
 //! 4. Spawns uvicorn as a child process on that port
@@ -182,9 +182,7 @@ impl ProxyManager {
     }
 
     fn proxy_dir() -> PathBuf {
-        dirs::home_dir()
-            .expect("Could not determine home directory")
-            .join(".warp-proxy")
+        warp_core::paths::data_dir().join("proxy")
     }
 
     /// Find an available TCP port by binding to port 0.
